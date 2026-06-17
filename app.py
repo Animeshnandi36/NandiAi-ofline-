@@ -50,7 +50,7 @@ if prompt := st.chat_input("Enter secure query..."):
         except Exception as e:
             err_msg = f"Error generating response: {e}"
             placeholder.markdown(err_msg)
-            full_response += "\n" + err_msg
+            full_response = err_msg
 
     # Save the completed assistant message
     st.session_state.messages.append({"role": "assistant", "content": full_response})
