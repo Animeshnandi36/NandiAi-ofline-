@@ -6,6 +6,7 @@ import logging
 try:
     from langchain_ollama import ChatOllama
     from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+    from langchain_core.messages import HumanMessage, AIMessage
     from langchain_core.chat_history import InMemoryChatMessageHistory
     from langchain_core.runnables.history import RunnableWithMessageHistory
 except Exception:
@@ -17,17 +18,16 @@ except Exception:
     MessagesPlaceholder = None
     InMemoryChatMessageHistory = None
     RunnableWithMessageHistory = None
+    HumanMessage = None
+    AIMessage = None
 
 # Minimal robust in-memory session store:
-_store: Dict[str, List[Dict[str, str]]] = {}
+_store: Dict[str, InMemoryChatMessageHistory] = {}
 
-def get_session_history(session_id: str) -> List[Dict[str, str]]:
-    """Return a list of messages (dicts with role/content) for the session, trimmed to last 10 messages."""
+def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
+    """Return an InMemoryChatMessageHistory object for the session."""
     if session_id not in _store:
-        _store[session_id] = []
-    # Trim to last 10 messages (10 user/assistant messages combined -> ~5 turns)
-    if len(_store[session_id]) > 10:
-        _store[session_id] = _store[session_id][-10:]
+        _store[session_id] = InMemoryChatMessageHistory() if InMemoryChatMessageHistory is not None else None
     return _store[session_id]
 
 # Model instantiation (ensure ChatOllama is available in your environment)
@@ -52,34 +52,23 @@ if prompt is not None and llm is not None:
 if chain is not None and RunnableWithMessageHistory is not None:
     conversation = RunnableWithMessageHistory(
         chain,
-        lambda sid: InMemoryChatMessageHistory() if InMemoryChatMessageHistory is not None else None,
+        get_session_history,
         input_messages_key="input",
         history_messages_key="history",
     )
-
-def _format_history_for_chain(history: List[Dict[str, str]]) -> List[Any]:
-    """
-    Convert our simple list-of-dict history into the format your chain expects.
-    This function may need adjustment depending on your LangChain version.
-    """
-    formatted = []
-    for msg in history:
-        formatted.append((msg["role"], msg["content"]))
-    return formatted
 
 def get_response(user_input: str, session_id: str) -> Generator[str, None, None]:
     """
     Returns a generator yielding chunks of text (strings).
     The UI expects an iterable of text parts to stream.
     """
-    # Update session store with the user message
+    # Add user message to session history
     history = get_session_history(session_id)
-    history.append({"role": "user", "content": user_input})
-    # Keep history trimmed
-    if len(history) > 10:
-        history[:] = history[-10:]
+    if history is not None and HumanMessage is not None:
+        history.add_message(HumanMessage(content=user_input))
 
     # If LangChain conversation is available, attempt to stream from it.
+    full_response = ""
     try:
         if conversation is not None:
             # Many LangChain runnables provide .stream or iterator-like outputs; attempt to use it.
@@ -87,23 +76,36 @@ def get_response(user_input: str, session_id: str) -> Generator[str, None, None]
             # If it's an iterable/generator, yield its chunks
             if hasattr(stream_output, "__iter__"):
                 for chunk in stream_output:
-                    yield chunk
+                    # Handle different chunk types
+                    if isinstance(chunk, str):
+                        text = chunk
+                    elif hasattr(chunk, 'content'):
+                        text = chunk.content
+                    else:
+                        text = str(chunk)
+                    full_response += text
+                    yield text
             else:
                 # Not iterable: convert to string and yield once
-                yield str(stream_output)
+                text = str(stream_output)
+                full_response += text
+                yield text
         else:
             # Fallback: simple echo responder for offline testing
             reply = "Nandi Ai here. (LangChain not initialized.) You asked: " + user_input
             # yield in two chunks to simulate streaming
             mid = len(reply) // 2
+            full_response = reply
             yield reply[:mid]
             yield reply[mid:]
     except Exception as exc:
         # Yield an error message so the UI shows something
         error_text = f"[Nandi Ai error: {exc}]"
         logging.exception("Failed to get response from LLM/chain.")
+        full_response = error_text
         yield error_text
     finally:
-        # Append assistant final placeholder (actual final content appended by the UI)
-        # Optionally, save a placeholder back into session history; the UI will save the final text itself.
-        pass
+        # Save the assistant's response to session history
+        history = get_session_history(session_id)
+        if history is not None and AIMessage is not None and full_response:
+            history.add_message(AIMessage(content=full_response))
